@@ -401,6 +401,315 @@ int api_message(const JNode* pool, int msg, char* role, size_t rcap, Sb* out) {
     return 0;
 }
 
+// ---- tool calling -------------------------------------------------------------------------------------------------
+
+void sb_trim(Sb* s) {
+    if (!s->p) return;
+    size_t a = 0, b = s->n;
+    while (a < b && strchr(" \t\r\n", s->p[a])) a++;
+    while (b > a && strchr(" \t\r\n", s->p[b - 1])) b--;
+    memmove(s->p, s->p + a, b - a);
+    s->n = b - a;
+    s->p[s->n] = 0;
+}
+
+void api_json_dump(const JNode* pool, int node, Sb* out, int spaced) {
+    const JNode* d = &pool[node];
+    switch (d->type) {
+    case J_NULL: sb_str(out, "null"); break;
+    case J_BOOL: sb_str(out, d->b ? "true" : "false"); break;
+    case J_NUM: {
+        char b[40];
+        if (!(d->num == d->num) || d->num > 1e300 || d->num < -1e300) strcpy(b, "null");
+        else if (d->num == (double)(long long)d->num && d->num < 1e15 && d->num > -1e15) snprintf(b, sizeof(b), "%lld", (long long)d->num);
+        else snprintf(b, sizeof(b), "%.17g", d->num);
+        sb_str(out, b);
+        break;
+    }
+    case J_STR: {
+        Sb t;
+        sb_init(&t);
+        json_str_sb(pool, node, &t);
+        sb_json_str(out, t.p ? t.p : "", t.n);
+        sb_free(&t);
+        break;
+    }
+    default: {
+        int obj = d->type == J_OBJ;
+        sb_str(out, obj ? "{" : "[");
+        for (int c = d->first; c >= 0; c = pool[c].next) {
+            if (c != d->first) sb_str(out, spaced ? ", " : ",");
+            if (obj) {
+                sb_str(out, "\"");
+                sb_add(out, pool[c].key, pool[c].klen);   // (kept as written: already escaped)
+                sb_str(out, spaced ? "\": " : "\":");
+            }
+            api_json_dump(pool, c, out, spaced);
+        }
+        sb_str(out, obj ? "}" : "]");
+    }
+    }
+}
+
+// Qwen3.5's chat template, tools part (verbatim from chat_template.jinja of Qwen/Qwen3.5-9B).
+void api_tools_prompt(const JNode* pool, int tools, int required, Sb* out) {
+    sb_str(out, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    for (int t = pool[tools].first; t >= 0; t = pool[t].next) {
+        sb_str(out, "\n");
+        api_json_dump(pool, t, out, 1);
+    }
+    sb_str(out, "\n</tools>");
+    sb_str(out, "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+                "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+                "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+                "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+                "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested "
+                "within <tool_call></tool_call> XML tags\n"
+                "- Required parameters MUST be specified\n"
+                "- You may provide optional reasoning for your function call in natural language BEFORE the function call, "
+                "but NOT after\n"
+                "- If there is no function call available, answer the question like normal with your current knowledge and "
+                "do not tell the user about function calls\n");
+    // (not in the template: tool_choice "required", best effort)
+    if (required) sb_str(out, "- You MUST call one of the functions above in this reply\n");
+    sb_str(out, "</IMPORTANT>");
+}
+
+// The parameters of one call (obj: an object node of pool), as the template writes them.
+static void render_params(const JNode* pool, int obj, Sb* out) {
+    for (int c = pool[obj].first; c >= 0; c = pool[c].next) {
+        sb_str(out, "<parameter=");
+        sb_add(out, pool[c].key, pool[c].klen);
+        sb_str(out, ">\n");
+        switch (pool[c].type) {
+        case J_STR: json_str_sb(pool, c, out); break;
+        case J_OBJ:
+        case J_ARR: api_json_dump(pool, c, out, 1); break;
+        case J_BOOL: sb_str(out, pool[c].b ? "True" : "False"); break;   // (Python's str(), as in the template)
+        case J_NULL: sb_str(out, "None"); break;
+        default: api_json_dump(pool, c, out, 1);
+        }
+        sb_str(out, "\n</parameter>\n");
+    }
+}
+
+int api_assistant_calls(const JNode* pool, int msg, int has_content, Sb* out) {
+    int tc = json_get(pool, msg, "tool_calls");
+    if (tc < 0 || pool[tc].type == J_NULL) return 0;
+    if (pool[tc].type != J_ARR) return -1;
+    int first = 1;
+    for (int c = pool[tc].first; c >= 0; c = pool[c].next) {
+        if (pool[c].type != J_OBJ) return -1;
+        int fn = json_get(pool, c, "function");
+        if (fn < 0 || pool[fn].type != J_OBJ) fn = c;
+        int nm = json_get(pool, fn, "name");
+        if (nm < 0 || pool[nm].type != J_STR) return -1;
+        sb_str(out, first ? (has_content ? "\n\n" : "") : "\n");
+        first = 0;
+        sb_str(out, "<tool_call>\n<function=");
+        json_str_sb(pool, nm, out);
+        sb_str(out, ">\n");
+        int a = json_get(pool, fn, "arguments");
+        if (a >= 0 && pool[a].type == J_OBJ) {
+            render_params(pool, a, out);
+        } else if (a >= 0 && pool[a].type == J_STR) {   // OpenAI: the arguments are a JSON text
+            Sb txt;
+            sb_init(&txt);
+            json_str_sb(pool, a, &txt);
+            JNode* ap = malloc(sizeof(JNode) * 512);
+            int root = ap && txt.p ? json_parse(txt.p, txt.n, ap, 512) : -1;
+            if (root >= 0 && ap[root].type == J_OBJ) render_params(ap, root, out);   // (anything else: no parameters)
+            free(ap);
+            sb_free(&txt);
+        }
+        sb_str(out, "</function>\n</tool_call>");
+    }
+    return out->oom ? -1 : 0;
+}
+
+static int lit_at(const char* p, const char* end, const char* lit) {
+    size_t m = strlen(lit);
+    return (size_t)(end - p) >= m && !memcmp(p, lit, m);
+}
+
+static const char* lit_find(const char* p, const char* end, const char* lit) {
+    size_t m = strlen(lit);
+    for (; (size_t)(end - p) >= m; p++)
+        if (*p == lit[0] && !memcmp(p, lit, m)) return p;
+    return NULL;
+}
+
+static const char* skip_ws(const char* p, const char* end) {
+    while (p < end && strchr(" \t\r\n", *p)) p++;
+    return p;
+}
+
+long api_tag_find(const char* p, size_t n) {
+    const char* f = lit_find(p, p + n, "<tool_call>");
+    return f ? (long)(f - p) : -1;
+}
+
+size_t api_tag_holdback(const char* p, size_t n) {
+    for (size_t k = n < 10 ? n : 10; k > 0; k--)   // (a whole tag is not "held back": it is found)
+        if (!memcmp(p + n - k, "<tool_call>", k)) return k;
+    return 0;
+}
+
+// The type the schema of function fn gives to its parameter pn ("string", "number"...), or NULL.
+static const char* schema_type(const JNode* pool, int tools, const Sb* fn, const char* pn, size_t* len) {
+    if (tools < 0 || !fn->p) return NULL;
+    for (int t = pool[tools].first; t >= 0; t = pool[t].next) {
+        int f = json_get(pool, t, "function");
+        int nm = json_get(pool, f, "name");
+        if (nm < 0 || pool[nm].type != J_STR || pool[nm].slen != fn->n || memcmp(pool[nm].s, fn->p, fn->n)) continue;
+        int ty = json_get(pool, json_get(pool, json_get(pool, f, "parameters"), "properties"), pn);
+        ty = json_get(pool, ty, "type");
+        if (ty < 0 || pool[ty].type != J_STR) return NULL;
+        *len = pool[ty].slen;
+        return pool[ty].s;
+    }
+    return NULL;
+}
+
+static int json_number_ok(const char* s, size_t n) {   // -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+    size_t i = 0;
+    if (i < n && s[i] == '-') i++;
+    if (i >= n || s[i] < '0' || s[i] > '9') return 0;
+    if (s[i] == '0') i++;
+    else while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+    if (i < n && s[i] == '.') {
+        size_t d = ++i;
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+        if (i == d) return 0;
+    }
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        if (i < n && (s[i] == '+' || s[i] == '-')) i++;
+        size_t d = i;
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+        if (i == d) return 0;
+    }
+    return i == n;
+}
+
+// One parameter's value (as text) in the JSON of the arguments.
+static void param_value(Sb* out, const char* v, size_t n, const char* ty, size_t tlen) {
+    int is_string = ty && tlen == 6 && !memcmp(ty, "string", 6);
+    const char* a = skip_ws(v, v + n);
+    const char* b = v + n;
+    while (b > a && strchr(" \t\r\n", b[-1])) b--;
+    size_t m = b - a;
+    if (!is_string && m) {
+        if ((m == 4 && !memcmp(a, "true", 4)) || (m == 5 && !memcmp(a, "false", 5)) || (m == 4 && !memcmp(a, "null", 4)) ||
+            json_number_ok(a, m)) {
+            sb_add(out, a, m);
+            return;
+        }
+        if (ty && m == 4 && !memcmp(a, "True", 4)) return sb_str(out, "true");   // (the template writes Python's str())
+        if (ty && m == 5 && !memcmp(a, "False", 5)) return sb_str(out, "false");
+        if (ty && m == 4 && !memcmp(a, "None", 4)) return sb_str(out, "null");
+        if (*a == '{' || *a == '[') {
+            JNode* pool = malloc(sizeof(JNode) * 256);
+            int root = pool ? json_parse(a, m, pool, 256) : -1;
+            if (root >= 0) {
+                api_json_dump(pool, root, out, 0);
+                free(pool);
+                return;
+            }
+            free(pool);
+        }
+    }
+    sb_json_str(out, v, n);
+}
+
+// One block (between <tool_call> and </tool_call>): <function=NAME> <parameter=ARG> VALUE </parameter>... </function>
+static int parse_block(const char* p, const char* end, const JNode* pool, int tools, ApiCall* c) {
+    p = skip_ws(p, end);
+    if (!lit_at(p, end, "<function=")) return -1;
+    p += 10;
+    const char* gt = memchr(p, '>', end - p);
+    if (!gt) return -1;
+    sb_add(&c->name, p, gt - p);
+    sb_trim(&c->name);
+    if (!c->name.n || memchr(c->name.p, '<', c->name.n)) return -1;
+    p = gt + 1;
+    sb_str(&c->args, "{");
+    int np = 0;
+    for (;;) {
+        p = skip_ws(p, end);
+        if (!lit_at(p, end, "<parameter=")) break;
+        p += 11;
+        gt = memchr(p, '>', end - p);
+        if (!gt) return -1;
+        Sb pn;
+        sb_init(&pn);
+        sb_add(&pn, p, gt - p);
+        sb_trim(&pn);
+        const char* close = lit_find(gt + 1, end, "</parameter>");
+        if (!close || !pn.n) {
+            sb_free(&pn);
+            return -1;
+        }
+        const char* v = gt + 1;
+        if (v < close && *v == '\n') v++;   // (the template puts a line break before and after the value)
+        const char* ve = close;
+        if (ve > v && ve[-1] == '\n') ve--;
+        if (np++) sb_str(&c->args, ",");
+        sb_json_str(&c->args, pn.p, pn.n);
+        sb_str(&c->args, ":");
+        size_t tl = 0;
+        const char* ty = schema_type(pool, tools, &c->name, pn.p, &tl);
+        param_value(&c->args, v, ve - v, ty, tl);
+        sb_free(&pn);
+        p = close + 12;
+    }
+    p = skip_ws(p, end);
+    if (lit_at(p, end, "</function>")) p = skip_ws(p + 11, end);
+    if (p != end) return -1;
+    sb_str(&c->args, "}");
+    return c->name.oom || c->args.oom ? -1 : 0;
+}
+
+int api_parse_tool_calls(const char* text, size_t n, const JNode* pool, int tools, ApiCall* calls, int max,
+                         unsigned first_id, size_t* text_end) {
+    const char* end = text + n;
+    const char* p = text;
+    int k = 0;
+    *text_end = n;
+    while (k < max) {
+        const char* open = lit_find(p, end, "<tool_call>");
+        if (!open) break;
+        const char* body = open + 11;
+        const char* close = lit_find(body, end, "</tool_call>");
+        const char* body_end = close;
+        const char* next = close ? close + 12 : end;
+        if (!close) {   // the turn ended before </tool_call>: fine if the call itself is whole
+            if (!lit_find(body, end, "</function>")) break;
+            body_end = end;
+        }
+        ApiCall* c = &calls[k];
+        sb_init(&c->name);
+        sb_init(&c->args);
+        c->id = first_id + k;
+        if (parse_block(body, body_end, pool, tools, c)) {
+            sb_free(&c->name);
+            sb_free(&c->args);
+            break;
+        }
+        if (!k) *text_end = open - text;
+        k++;
+        p = next;
+    }
+    return k;
+}
+
+void api_calls_free(ApiCall* calls, int n) {
+    for (int i = 0; i < n; i++) {
+        sb_free(&calls[i].name);
+        sb_free(&calls[i].args);
+    }
+}
+
 // ---- JSON writers -------------------------------------------------------------------------------------------------
 
 void api_json_models(Sb* out, const char* model, long long created) {
@@ -411,8 +720,29 @@ void api_json_models(Sb* out, const char* model, long long created) {
     sb_str(out, ",\"owned_by\":\"garlic-llm\"}]}");
 }
 
-void api_json_completion(Sb* out, const char* id, const char* model, long long created, const char* text, size_t tlen,
-                         const char* finish, int prompt_tokens, int completion_tokens) {
+static void calls_json(Sb* out, const ApiCall* calls, int n, int indexed) {
+    sb_str(out, "[");
+    for (int i = 0; i < n; i++) {
+        if (i) sb_str(out, ",");
+        sb_str(out, "{");
+        if (indexed) {
+            sb_str(out, "\"index\":");
+            sb_int(out, i);
+            sb_str(out, ",");
+        }
+        sb_str(out, "\"id\":\"call_");
+        sb_int(out, calls[i].id);
+        sb_str(out, "\",\"type\":\"function\",\"function\":{\"name\":");
+        sb_json_str(out, calls[i].name.p ? calls[i].name.p : "", calls[i].name.n);
+        sb_str(out, ",\"arguments\":");
+        sb_json_str(out, calls[i].args.p ? calls[i].args.p : "", calls[i].args.n);
+        sb_str(out, "}}");
+    }
+    sb_str(out, "]");
+}
+
+static void completion(Sb* out, const char* id, const char* model, long long created, const char* text, size_t tlen,
+                       const ApiCall* calls, int ncalls, const char* finish, int prompt_tokens, int completion_tokens) {
     sb_str(out, "{\"id\":");
     sb_json_str(out, id, strlen(id));
     sb_str(out, ",\"object\":\"chat.completion\",\"created\":");
@@ -420,7 +750,12 @@ void api_json_completion(Sb* out, const char* id, const char* model, long long c
     sb_str(out, ",\"model\":");
     sb_json_str(out, model, strlen(model));
     sb_str(out, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
-    sb_json_str(out, text, tlen);
+    if (ncalls > 0 && tlen == 0) sb_str(out, "null");
+    else sb_json_str(out, text, tlen);
+    if (ncalls > 0) {
+        sb_str(out, ",\"tool_calls\":");
+        calls_json(out, calls, ncalls, 0);
+    }
     sb_str(out, "},\"finish_reason\":");
     sb_json_str(out, finish, strlen(finish));
     sb_str(out, "}],\"usage\":{\"prompt_tokens\":");
@@ -430,6 +765,28 @@ void api_json_completion(Sb* out, const char* id, const char* model, long long c
     sb_str(out, ",\"total_tokens\":");
     sb_int(out, prompt_tokens + completion_tokens);
     sb_str(out, "}}");
+}
+
+void api_json_completion(Sb* out, const char* id, const char* model, long long created, const char* text, size_t tlen,
+                         const char* finish, int prompt_tokens, int completion_tokens) {
+    completion(out, id, model, created, text, tlen, NULL, 0, finish, prompt_tokens, completion_tokens);
+}
+
+void api_json_completion_calls(Sb* out, const char* id, const char* model, long long created, const char* text,
+                               size_t tlen, const ApiCall* calls, int n, int prompt_tokens, int completion_tokens) {
+    completion(out, id, model, created, text, tlen, calls, n, "tool_calls", prompt_tokens, completion_tokens);
+}
+
+void api_json_chunk_calls(Sb* out, const char* id, const char* model, long long created, const ApiCall* calls, int n) {
+    sb_str(out, "{\"id\":");
+    sb_json_str(out, id, strlen(id));
+    sb_str(out, ",\"object\":\"chat.completion.chunk\",\"created\":");
+    sb_int(out, created);
+    sb_str(out, ",\"model\":");
+    sb_json_str(out, model, strlen(model));
+    sb_str(out, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
+    calls_json(out, calls, n, 1);
+    sb_str(out, "},\"finish_reason\":null}]}");
 }
 
 void api_json_chunk(Sb* out, const char* id, const char* model, long long created, const char* role, const char* text,
@@ -524,6 +881,40 @@ int api_chat_parse(const char* body, size_t len, JNode* pool, int max, ChatReque
         *err = "Only n = 1 is supported.";
         return -1;
     }
+    // tools: put in the prompt unless tool_choice is "none" ("auto" and the rest: the model decides)
+    req->tools = -1;
+    int none = 0;
+    int tc = json_get(pool, req->root, "tool_choice");
+    if (tc >= 0 && pool[tc].type == J_STR) {
+        if (pool[tc].slen == 4 && !memcmp(pool[tc].s, "none", 4)) none = 1;
+        else if (pool[tc].slen == 8 && !memcmp(pool[tc].s, "required", 8)) req->tool_required = 1;
+        else if (!(pool[tc].slen == 4 && !memcmp(pool[tc].s, "auto", 4))) {
+            *err = "'tool_choice' must be \"none\", \"auto\", \"required\" or a function.";
+            return -1;
+        }
+    } else if (tc >= 0 && pool[tc].type == J_OBJ) {
+        req->tool_required = 1;   // a named function: asked for as "required" (the name is not enforced)
+    } else if (tc >= 0 && pool[tc].type != J_NULL) {
+        *err = "'tool_choice' must be a string or an object.";
+        return -1;
+    }
+    int tl = json_get(pool, req->root, "tools");
+    if (tl >= 0 && pool[tl].type != J_NULL) {
+        if (pool[tl].type != J_ARR) {
+            *err = "'tools' must be an array.";
+            return -1;
+        }
+        for (int c = pool[tl].first; c >= 0; c = pool[c].next) {
+            int f = json_get(pool, c, "function");
+            int nm = json_get(pool, f, "name");
+            if (nm < 0 || pool[nm].type != J_STR || pool[nm].slen == 0) {
+                *err = "Each tool must be {\"type\":\"function\",\"function\":{\"name\":...}}.";
+                return -1;
+            }
+        }
+        if (pool[tl].count > 0 && !none) req->tools = tl;
+    }
+    if (req->tools < 0) req->tool_required = 0;
     int sd = json_get(pool, req->root, "seed");
     if (sd >= 0 && pool[sd].type == J_NUM && pool[sd].num >= 0) {
         req->seed = (unsigned)pool[sd].num;
