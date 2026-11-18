@@ -1,7 +1,7 @@
 // Host test for chat/api_run.inc (the API's model side), with a mock engine and tokenizer, so the job logic runs
 // without the PS4. The real file is included as main.c includes it. Every test runs twice: one token per step
 // (engine_run), and several per step as with the MTP head (engine_spec_step).
-// Build and run: gcc -std=gnu99 -Wall -Wextra -g -fsanitize=address,undefined -I chat tests/api_run_test.c chat/api_proto.c -o build/api_run_test && build/api_run_test
+// Build and run: gcc -std=gnu99 -Wall -Wextra -g -fsanitize=address,undefined -I chat tests/api_run_test.c chat/api_proto.c -lm -o build/api_run_test && build/api_run_test
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>

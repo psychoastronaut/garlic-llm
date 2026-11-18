@@ -1,5 +1,5 @@
 // Host tests for chat/api_proto.c (the OpenAI-compatible API's protocol part).
-// Build and run: gcc -std=c99 -Wall -Wextra -g -fsanitize=address,undefined -I chat tests/api_proto_test.c chat/api_proto.c -o build/api_proto_test && build/api_proto_test
+// Build and run: gcc -std=c99 -Wall -Wextra -g -fsanitize=address,undefined -I chat tests/api_proto_test.c chat/api_proto.c -lm -o build/api_proto_test && build/api_proto_test
 #include <stdio.h>
 #include <string.h>
 
