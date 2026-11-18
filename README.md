@@ -111,7 +111,12 @@ curl http://192.168.1.5:8080/v1/chat/completions \
 - Replies are generated the way the chat generates its own, speculative decoding included.
 - One request runs at a time, and the chat screen is busy while it does: it says that a request is being answered, and ○ stops the reply (the client gets what was written so far, with `finish_reason: "length"`). Requests wait while the keyboard, voice mode or a Python program is open.
 - A request is a conversation of its own, so the one on the console's screen is cleared.
-- Reasoning is off. Only `n = 1` is supported; `tools`, `logprobs` and similar parameters are ignored.
+- Reasoning is off. Only `n = 1` is supported; `logprobs` and similar parameters are ignored.
+- **Tool calling** (OpenAI `tools` / `tool_calls`, with or without `stream`) works with the Qwen3.5 models. The tools go in the system message in Qwen3.5's own chat-template format (`<tools>` block; the model answers `<tool_call><function=NAME><parameter=ARG>…`), and the reply is turned into `message.tool_calls` with `finish_reason: "tool_calls"` (`content` is the text before the call, or `null`). Send the results back as `role: "tool"` messages after the assistant message that holds the `tool_calls`; they are matched to the calls by order (`tool_call_id` is accepted but not used).
+  - A parameter's value is typed by the tool's JSON Schema (`"type": "string"` keeps it a string); with no schema type, a value that is valid JSON becomes that JSON and anything else a string.
+  - Streaming: text streams as usual until the model starts a call; the calls are then sent whole in one chunk (not argument by argument), then the final chunk with `finish_reason: "tool_calls"`.
+  - `tool_choice`: `"auto"` (default) and `"none"` (tools not given to the model) work. `"required"`, or a named function, only adds a line to the prompt asking for a call: best effort, and the name is not enforced.
+  - Limits: up to 8 calls per reply. The tool definitions use context (the window is 16K tokens in all, the fixed part of the tools prompt is a few hundred tokens, and the schemas come on top: a dozen tools can take several thousand): a request that does not fit gets `context_length_exceeded`. A reply that cuts off inside a call (or whose call is not well formed) is returned as plain text. Without `tools` in the request nothing changes.
 - For an API key, put it in `/data/garlic_api_key.txt` on the console. Requests then need `Authorization: Bearer <key>`. Without that file, anyone on your network can use the API while it is on, and clients that insist on a key accept any text.
 - If the screen shows `API · :8080`, the app could not read the console's address: it is in *Settings → Network → View Connection Status*.
 

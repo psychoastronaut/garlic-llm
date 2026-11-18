@@ -4,7 +4,7 @@
     "title": "Garlic LLM API",
     "version": "1.20",
     "summary": "OpenAI-compatible chat API for Garlic LLM, running on a PlayStation 4.",
-    "description": "Garlic LLM runs Qwen3.5 on the PS4's own GPU. This API speaks the OpenAI Chat Completions protocol, so existing OpenAI client libraries work by changing the base URL to http://<console-address>:8080/v1.\n\nThe API is off until it is turned on with L3 on the console's chat screen, which then shows the address.\n\nOne request runs at a time; a request sent meanwhile waits for it. While the model answers, the console's screen says so and the conversation that was on it is cleared. Circle on the controller stops the reply: the client gets what was written so far, with finish_reason \"length\".\n\nReasoning is always off. Parameters the console does not implement (for example tools, logprobs, presence_penalty) are ignored. Only n = 1 is supported.",
+    "description": "Garlic LLM runs Qwen3.5 on the PS4's own GPU. This API speaks the OpenAI Chat Completions protocol, so existing OpenAI client libraries work by changing the base URL to http://<console-address>:8080/v1.\n\nThe API is off until it is turned on with L3 on the console's chat screen, which then shows the address.\n\nOne request runs at a time; a request sent meanwhile waits for it. While the model answers, the console's screen says so and the conversation that was on it is cleared. Circle on the controller stops the reply: the client gets what was written so far, with finish_reason \"length\".\n\nReasoning is always off. Tools are supported (see the tools field): the model may answer with tool_calls, and the results go back as messages with the role \"tool\". Other parameters the console does not implement (for example logprobs, presence_penalty) are ignored. Only n = 1 is supported.",
     "license": { "name": "MIT", "identifier": "MIT" }
   },
   "servers": [
@@ -127,11 +127,19 @@
       },
       "Message": {
         "type": "object",
-        "required": ["role", "content"],
+        "required": ["role"],
         "properties": {
           "role": { "$ref": "#/components/schemas/Role" },
+          "tool_calls": {
+            "type": "array",
+            "description": "Assistant messages: the calls the assistant made earlier (as this API returned them).",
+            "items": { "$ref": "#/components/schemas/ToolCall" }
+          },
+          "tool_call_id": { "type": "string", "description": "Tool messages: accepted, not used. The results are matched to the calls by their order." },
           "content": {
+            "description": "The text; for a tool message, the result of the call. May be null or missing on an assistant message that has tool_calls.",
             "oneOf": [
+              { "type": "null" },
               { "type": "string" },
               {
                 "type": "array",
@@ -148,6 +156,38 @@
           }
         }
       },
+      "Tool": {
+        "type": "object",
+        "required": ["type", "function"],
+        "properties": {
+          "type": { "type": "string", "const": "function" },
+          "function": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "description": { "type": "string" },
+              "parameters": { "type": "object", "description": "A JSON Schema. The type of each property (string, number, boolean...) decides how the model's text for it becomes JSON." }
+            }
+          }
+        }
+      },
+      "ToolCall": {
+        "type": "object",
+        "required": ["id", "type", "function"],
+        "properties": {
+          "id": { "type": "string", "example": "call_1" },
+          "type": { "type": "string", "const": "function" },
+          "function": {
+            "type": "object",
+            "required": ["name", "arguments"],
+            "properties": {
+              "name": { "type": "string" },
+              "arguments": { "type": "string", "description": "A JSON object, as text." }
+            }
+          }
+        }
+      },
       "ChatCompletionRequest": {
         "type": "object",
         "required": ["messages"],
@@ -159,7 +199,19 @@
           "max_completion_tokens": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Same as max_tokens; it wins when both are given." },
           "stream": { "type": "boolean", "default": false },
           "seed": { "type": "integer", "minimum": 0, "description": "Makes the sampling repeatable." },
-          "n": { "type": "integer", "const": 1, "default": 1 }
+          "n": { "type": "integer", "const": 1, "default": 1 },
+          "tools": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Tool" },
+            "description": "Functions the model may call. They go in the prompt in Qwen3.5's own format and take context (16K tokens in all): a request that does not fit is refused with context_length_exceeded. Needs a Qwen3.5 model."
+          },
+          "tool_choice": {
+            "description": "\"auto\" (default): the model decides. \"none\": the tools are not given to the model. \"required\" (or a named function): the prompt asks for a call, best effort, which the model may still not follow; the name is not enforced.",
+            "oneOf": [
+              { "type": "string", "enum": ["auto", "none", "required"] },
+              { "type": "object" }
+            ]
+          }
         }
       },
       "Usage": {
@@ -191,10 +243,11 @@
                   "required": ["role", "content"],
                   "properties": {
                     "role": { "type": "string", "const": "assistant" },
-                    "content": { "type": "string" }
+                    "content": { "type": ["string", "null"], "description": "null when the reply is only tool calls." },
+                    "tool_calls": { "type": "array", "items": { "$ref": "#/components/schemas/ToolCall" }, "description": "Up to 8 calls, when the model called tools; finish_reason is then \"tool_calls\"." }
                   }
                 },
-                "finish_reason": { "type": "string", "enum": ["stop", "length"] }
+                "finish_reason": { "type": "string", "enum": ["stop", "length", "tool_calls"] }
               }
             }
           },
@@ -220,10 +273,26 @@
                   "type": "object",
                   "properties": {
                     "role": { "type": "string", "const": "assistant" },
-                    "content": { "type": "string" }
+                    "content": { "type": "string" },
+                    "tool_calls": {
+                      "type": "array",
+                      "description": "Tool calls come whole in one chunk after the text (the text of a call is held back until it is complete), each with its index.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": { "type": "integer" },
+                          "id": { "type": "string" },
+                          "type": { "type": "string", "const": "function" },
+                          "function": {
+                            "type": "object",
+                            "properties": { "name": { "type": "string" }, "arguments": { "type": "string" } }
+                          }
+                        }
+                      }
+                    }
                   }
                 },
-                "finish_reason": { "type": ["string", "null"], "enum": ["stop", "length", null] }
+                "finish_reason": { "type": ["string", "null"], "enum": ["stop", "length", "tool_calls", null] }
               }
             }
           }
