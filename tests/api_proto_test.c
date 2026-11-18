@@ -119,7 +119,8 @@ static void test_chat(void) {
 static const char* TOOLS =
     "[{\"type\":\"function\",\"function\":{\"name\":\"t\",\"parameters\":{\"type\":\"object\",\"properties\":{"
     "\"n\":{\"type\":\"number\"},\"b\":{\"type\":\"boolean\"},\"o\":{\"type\":\"object\"},\"a\":{\"type\":\"array\"},"
-    "\"s\":{\"type\":\"string\"},\"u\":{}}}}}]";
+    "\"s\":{\"type\":\"string\"},\"u\":{},\"sn\":{\"type\":[\"string\",\"null\"]},\"an\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]},"
+    "\"mx\":{\"type\":[\"string\",\"number\"]}}}}}]";
 
 // the arguments of the one call in reply (the schema above), or "(none)" if it holds no call
 static const char* args_of(const char* reply) {
@@ -189,6 +190,15 @@ static void test_tool_calls(void) {
     CHECK(!strcmp(ARGS("<parameter=s>\n\n</parameter>\n"), "{\"s\":\"\"}"));
     CHECK(!strcmp(ARGS("<parameter=s>\nno line breaks</parameter>\n"), "{\"s\":\"no line breaks\"}"));
     CHECK(!strcmp(ARGS("<parameter=s>\nx\n</parameter>\n<parameter=s>\ny\n</parameter>\n"), "{\"s\":\"x\",\"s\":\"y\"}"));
+
+    // a type that is a list, or anyOf: only strings (null aside) stay strings; mixed with another, a guess
+    CHECK(!strcmp(ARGS("<parameter=sn>\n123\n</parameter>\n<parameter=an>\ntrue\n</parameter>\n"), "{\"sn\":\"123\",\"an\":\"true\"}"));
+    CHECK(!strcmp(ARGS("<parameter=mx>\n123\n</parameter>\n<parameter=mx>\nabc\n</parameter>\n"), "{\"mx\":123,\"mx\":\"abc\"}"));
+    // member names of an object value are decoded and written again (a bad escape does not make bad JSON)
+    CHECK(!strcmp(ARGS("<parameter=o>\n{\"a\\q\":1, \"caf\xc3\xa9\":2, \"n\\nl\":3}\n</parameter>\n"),
+                  "{\"o\":{\"aq\":1,\"caf\xc3\xa9\":2,\"n\\nl\":3}}"));
+    // a NUL is not a space
+    CHECK(!strcmp(ARGS("<parameter=s>\n\n</parameter>\n"), "{\"s\":\"\"}"));
 
     // not a call: no tag, cut off, no function, a parameter that never closes, text inside, an empty name
     CHECK(!strcmp(args_of("just an answer"), "(none)"));
@@ -273,6 +283,14 @@ static void test_tool_request(void) {
     CHECK(strstr(s.p, "<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"f\", \"description\": \"d \\\"q\\\"\\n\xc3\xa9\", "
                       "\"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"number\", \"default\": 1.5}}, "
                       "\"required\": []}}}\n</tools>\n\nIf you choose") != NULL);
+    sb_free(&s);
+    // numbers: integers, the shortest float text, and a huge one (no overflow in the conversion)
+    const char* nums = "[{\"a\\u00e9\\q\":[0.1, 1e100, -3, 2.5e-7, 123456789012345678, 0.30000000000000004]}]";
+    JNode np[64];
+    int nr = json_parse(nums, strlen(nums), np, 64);
+    sb_init(&s);
+    api_json_dump(np, nr, &s, 1);
+    CHECK(!strcmp(s.p, "[{\"a\xc3\xa9q\": [0.1, 1e+100, -3, 2.5e-07, 1.2345678901234568e+17, 0.30000000000000004]}]"));
     sb_free(&s);
     sb_init(&s);
     CHECK(api_assistant_calls(pool, json_get(pool, root, "m"), 1, &s) == 0);

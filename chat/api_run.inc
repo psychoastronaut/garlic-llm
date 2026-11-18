@@ -368,7 +368,7 @@ static void api_job(ApiJob* job) {
         nc = api_parse_tool_calls(text.p, text.n, pool, cr.tools, calls, API_MAX_CALLS, api_call_seq + 1, &tend);
         api_call_seq += nc;
         if (nc) finish = "tool_calls";
-        while (tend > 0 && strchr(" \t\r\n", text.p[tend - 1])) tend--;
+        while (tend > 0 && (text.p[tend - 1] == ' ' || text.p[tend - 1] == '\t' || text.p[tend - 1] == '\r' || text.p[tend - 1] == '\n')) tend--;
     }
     free(pool);
     double dt = now() - t0;

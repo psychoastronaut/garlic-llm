@@ -1,6 +1,7 @@
 // OpenAI-compatible HTTP API, protocol part (see api_proto.h).
 #include "api_proto.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -338,10 +339,9 @@ static long hex4(const char* p, const char* end) {
     return v;
 }
 
-void json_str_sb(const JNode* pool, int node, Sb* out) {
-    if (node < 0 || pool[node].type != J_STR) return;
-    const char* p = pool[node].s;
-    const char* end = p + pool[node].slen;
+// the decoded text of raw JSON string contents (p, n)
+static void raw_str_sb(const char* p, size_t n, Sb* out) {
+    const char* end = p + n;
     while (p < end) {
         if (*p != '\\') {
             sb_add(out, p++, 1);
@@ -375,6 +375,20 @@ void json_str_sb(const JNode* pool, int node, Sb* out) {
     }
 }
 
+void json_str_sb(const JNode* pool, int node, Sb* out) {
+    if (node < 0 || pool[node].type != J_STR) return;
+    raw_str_sb(pool[node].s, pool[node].slen, out);
+}
+
+// a member name, decoded and written again as a JSON string
+static void key_json(const JNode* pool, int node, Sb* out) {
+    Sb k;
+    sb_init(&k);
+    raw_str_sb(pool[node].key, pool[node].klen, &k);
+    sb_json_str(out, k.p ? k.p : "", k.n);
+    sb_free(&k);
+}
+
 int api_message(const JNode* pool, int msg, char* role, size_t rcap, Sb* out) {
     if (msg < 0 || pool[msg].type != J_OBJ) return -1;
     int r = json_get(pool, msg, "role");
@@ -403,11 +417,13 @@ int api_message(const JNode* pool, int msg, char* role, size_t rcap, Sb* out) {
 
 // ---- tool calling -------------------------------------------------------------------------------------------------
 
+static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
 void sb_trim(Sb* s) {
     if (!s->p) return;
     size_t a = 0, b = s->n;
-    while (a < b && strchr(" \t\r\n", s->p[a])) a++;
-    while (b > a && strchr(" \t\r\n", s->p[b - 1])) b--;
+    while (a < b && is_ws(s->p[a])) a++;
+    while (b > a && is_ws(s->p[b - 1])) b--;
     memmove(s->p, s->p + a, b - a);
     s->n = b - a;
     s->p[s->n] = 0;
@@ -421,8 +437,13 @@ void api_json_dump(const JNode* pool, int node, Sb* out, int spaced) {
     case J_NUM: {
         char b[40];
         if (!(d->num == d->num) || d->num > 1e300 || d->num < -1e300) strcpy(b, "null");
-        else if (d->num == (double)(long long)d->num && d->num < 1e15 && d->num > -1e15) snprintf(b, sizeof(b), "%lld", (long long)d->num);
-        else snprintf(b, sizeof(b), "%.17g", d->num);
+        else if (d->num < 1e15 && d->num > -1e15 && d->num == floor(d->num)) snprintf(b, sizeof(b), "%lld", (long long)d->num);
+        else {   // the shortest digits that read back the same (as Python's repr)
+            for (int prec = 15; prec <= 17; prec++) {
+                snprintf(b, sizeof(b), "%.*g", prec, d->num);
+                if (strtod(b, NULL) == d->num) break;
+            }
+        }
         sb_str(out, b);
         break;
     }
@@ -440,9 +461,8 @@ void api_json_dump(const JNode* pool, int node, Sb* out, int spaced) {
         for (int c = d->first; c >= 0; c = pool[c].next) {
             if (c != d->first) sb_str(out, spaced ? ", " : ",");
             if (obj) {
-                sb_str(out, "\"");
-                sb_add(out, pool[c].key, pool[c].klen);   // (kept as written: already escaped)
-                sb_str(out, spaced ? "\": " : "\":");
+                key_json(pool, c, out);
+                sb_str(out, spaced ? ": " : ":");
             }
             api_json_dump(pool, c, out, spaced);
         }
@@ -479,7 +499,7 @@ void api_tools_prompt(const JNode* pool, int tools, int required, Sb* out) {
 static void render_params(const JNode* pool, int obj, Sb* out) {
     for (int c = pool[obj].first; c >= 0; c = pool[c].next) {
         sb_str(out, "<parameter=");
-        sb_add(out, pool[c].key, pool[c].klen);
+        raw_str_sb(pool[c].key, pool[c].klen, out);
         sb_str(out, ">\n");
         switch (pool[c].type) {
         case J_STR: json_str_sb(pool, c, out); break;
@@ -540,7 +560,7 @@ static const char* lit_find(const char* p, const char* end, const char* lit) {
 }
 
 static const char* skip_ws(const char* p, const char* end) {
-    while (p < end && strchr(" \t\r\n", *p)) p++;
+    while (p < end && is_ws(*p)) p++;
     return p;
 }
 
@@ -555,6 +575,11 @@ size_t api_tag_holdback(const char* p, size_t n) {
     return 0;
 }
 
+static void note_type(const JNode* t, int* has_string, const char** other, size_t* olen) {
+    if (t->slen == 6 && !memcmp(t->s, "string", 6)) *has_string = 1;
+    else if (!(t->slen == 4 && !memcmp(t->s, "null", 4)) && !*other) *other = t->s, *olen = t->slen;
+}
+
 // The type the schema of function fn gives to its parameter pn ("string", "number"...), or NULL.
 static const char* schema_type(const JNode* pool, int tools, const Sb* fn, const char* pn, size_t* len) {
     if (tools < 0 || !fn->p) return NULL;
@@ -562,11 +587,33 @@ static const char* schema_type(const JNode* pool, int tools, const Sb* fn, const
         int f = json_get(pool, t, "function");
         int nm = json_get(pool, f, "name");
         if (nm < 0 || pool[nm].type != J_STR || pool[nm].slen != fn->n || memcmp(pool[nm].s, fn->p, fn->n)) continue;
-        int ty = json_get(pool, json_get(pool, json_get(pool, f, "parameters"), "properties"), pn);
-        ty = json_get(pool, ty, "type");
-        if (ty < 0 || pool[ty].type != J_STR) return NULL;
-        *len = pool[ty].slen;
-        return pool[ty].s;
+        int prop = json_get(pool, json_get(pool, json_get(pool, f, "parameters"), "properties"), pn);
+        // the types the property allows: "type" (a name or a list) and those of anyOf / oneOf
+        int has_string = 0;
+        const char* other = NULL;
+        size_t olen = 0;
+        int srcs[3] = {json_get(pool, prop, "type"), -1, -1};
+        for (int i = 0; i < 3; i++) {
+            int s = i == 0 ? srcs[0] : json_get(pool, prop, i == 1 ? "anyOf" : "oneOf");
+            if (s < 0) continue;
+            if (i == 0 && pool[s].type == J_STR) note_type(&pool[s], &has_string, &other, &olen);
+            else if (pool[s].type == J_ARR)
+                for (int e = pool[s].first; e >= 0; e = pool[e].next) {
+                    int ty = i == 0 ? e : json_get(pool, e, "type");   // (an anyOf entry: {"type": ...})
+                    if (ty >= 0 && pool[ty].type == J_STR) note_type(&pool[ty], &has_string, &other, &olen);
+                }
+        }
+        // only strings (null aside): a string, whatever it looks like; mixed with other types, the other one (a guess
+        // from the text)
+        if (other) {
+            *len = olen;
+            return other;
+        }
+        if (has_string) {
+            *len = 6;
+            return "string";
+        }
+        return NULL;
     }
     return NULL;
 }
@@ -597,7 +644,7 @@ static void param_value(Sb* out, const char* v, size_t n, const char* ty, size_t
     int is_string = ty && tlen == 6 && !memcmp(ty, "string", 6);
     const char* a = skip_ws(v, v + n);
     const char* b = v + n;
-    while (b > a && strchr(" \t\r\n", b[-1])) b--;
+    while (b > a && is_ws(b[-1])) b--;
     size_t m = b - a;
     if (!is_string && m) {
         if ((m == 4 && !memcmp(a, "true", 4)) || (m == 5 && !memcmp(a, "false", 5)) || (m == 4 && !memcmp(a, "null", 4)) ||
