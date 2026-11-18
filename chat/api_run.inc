@@ -33,38 +33,162 @@ static int api_send_event(int fd, const char* json) {
     return r;
 }
 
+#define API_IDS 16384
+#define API_MAX_TEXT_TOOLS 60000   // (with tools: more bytes may come in, the prompt still has to fit api_ids)
+
+static int api_put(int n, uint32_t id) {
+    if (n < 0 || n >= API_IDS - 1) return -1;
+    api_ids[n] = id;
+    return n + 1;
+}
+
+// Text to ids. In a tools prompt the four tags the template writes around calls and results are single tokens
+// (added tokens of the vocabulary, not spelled out), as Hugging Face's tokenizer reads them in the text.
+static int api_text(int n, const char* z, int tags) {
+    static const struct {
+        const char* s;
+        uint32_t id;
+    } tg[] = {{"<tool_call>", TOOL_CALL}, {"</tool_call>", TOOL_CALL_END}, {"<tool_response>", TOOL_RESP},
+              {"</tool_response>", TOOL_RESP_END}};
+    while (n >= 0 && *z) {
+        const char* at = NULL;
+        int which = -1;
+        for (int i = 0; tags && i < 4; i++) {
+            const char* f = strstr(z, tg[i].s);
+            if (f && (!at || f < at)) at = f, which = i;
+        }
+        if (!at) {
+            n = encode_into(api_ids, n, API_IDS - 1, z);
+            return n >= API_IDS - 1 ? -1 : n;
+        }
+        if (at > z) {
+            char* part = malloc(at - z + 1);
+            if (!part) return -1;
+            memcpy(part, z, at - z);
+            part[at - z] = 0;
+            n = encode_into(api_ids, n, API_IDS - 1, part);
+            free(part);
+            if (n >= API_IDS - 1) return -1;
+        }
+        n = api_put(n, tg[which].id);
+        z = at + strlen(tg[which].s);
+    }
+    return n;
+}
+
 // Builds the prompt: each message as <|im_start|>role\ncontent<|im_end|>\n, then the assistant's turn with the empty
 // thought block (as the chat does, enable_thinking=false). Returns the number of ids, or -1 if it does not fit.
+// With tools (or messages that carry tool calls or results) it follows Qwen3.5's chat template for them: the tools
+// go in the system message, calls follow the assistant's text, results are <tool_response> blocks of a user turn,
+// contents are trimmed, and the turns after the last real question start with the empty thought block.
 static int api_prompt(const JNode* pool, const ChatRequest* cr) {
-    int n = 0;
+    int n = 0, tm = cr->tools >= 0, last_query = -1, idx = 0;
     size_t total = 0;
-    for (int m = pool[cr->messages].first; m >= 0; m = pool[m].next) {
+    for (int m = pool[cr->messages].first; m >= 0; m = pool[m].next, idx++) {   // is it a tools conversation?
+        Sb content;
+        sb_init(&content);
+        char role[16] = "user";
+        int ok = api_message(pool, m, role, sizeof(role), &content) == 0;
+        if (!strcmp(role, "tool") || json_get(pool, m, "tool_calls") >= 0) tm = 1;
+        if (ok && !strcmp(role, "user")) {
+            sb_trim(&content);
+            if (!(content.n >= 31 && !strncmp(content.p, "<tool_response>", 15) &&
+                  !strcmp(content.p + content.n - 16, "</tool_response>")))
+                last_query = idx;
+        }
+        sb_free(&content);
+        if (!ok) return -1;
+    }
+    size_t limit = tm ? API_MAX_TEXT_TOOLS : API_MAX_TEXT;
+    int first = pool[cr->messages].first, in_tool = 0;
+    if (cr->tools >= 0) {   // the system message: the tools, then the system prompt's text
+        Sb sys, c;
+        sb_init(&sys);
+        sb_init(&c);
+        api_tools_prompt(pool, cr->tools, cr->tool_required, &sys);
+        char role[16] = "";
+        if (api_message(pool, first, role, sizeof(role), &c) == 0 && !strcmp(role, "system")) {
+            sb_trim(&c);
+            if (c.n) sb_str(&sys, "\n\n"), sb_add(&sys, c.p, c.n);
+            first = pool[first].next;
+        }
+        total += sys.n;
+        n = api_put(n, IM_START);
+        n = api_text(n, "system\n", 0);
+        n = sys.p && !sys.oom && total <= limit ? api_text(n, sys.p, 1) : -1;
+        n = api_put(n, IM_END);
+        n = api_text(n, "\n", 0);
+        sb_free(&sys);
+        sb_free(&c);
+        if (n < 0) return -1;
+    }
+    idx = cr->tools >= 0 && first != pool[cr->messages].first ? 1 : 0;
+    for (int m = first; m >= 0; m = pool[m].next, idx++) {
         Sb content;
         sb_init(&content);
         char role[16] = "user";
         int ok = api_message(pool, m, role, sizeof(role), &content) == 0;
         if (ok) total += content.n;
-        if (!ok || total > API_MAX_TEXT) {
+        if (!ok || total > limit) {
             sb_free(&content);
             return -1;
         }
         if (strcmp(role, "system") && strcmp(role, "assistant") && strcmp(role, "user") && strcmp(role, "tool"))
             strcpy(role, "user");
-        api_ids[n++] = IM_START;
-        n = encode_into(api_ids, n, 16384, role);
-        n = encode_into(api_ids, n, 16384, "\n");
-        if (content.p) n = encode_into(api_ids, n, 16384, content.p);
-        api_ids[n++] = IM_END;
-        n = encode_into(api_ids, n, 16384, "\n");
+        int is_tool = tm && !strcmp(role, "tool");
+        if (tm) sb_trim(&content);
+        if (in_tool && !is_tool) {   // the results end: the user turn that held them
+            n = api_put(n, IM_END);
+            n = api_text(n, "\n", 0);
+            in_tool = 0;
+        }
+        if (is_tool) {   // consecutive results share one user turn (the template)
+            if (!in_tool) {
+                n = api_put(n, IM_START);
+                n = api_text(n, "user", 0);
+                in_tool = 1;
+            }
+            n = api_text(n, "\n<tool_response>\n", 1);
+            if (content.p) n = api_text(n, content.p, 1);
+            n = api_text(n, "\n</tool_response>", 1);
+            sb_free(&content);
+            if (n < 0) return -1;
+            continue;
+        }
+        Sb calls;
+        sb_init(&calls);
+        int is_asst = tm && !strcmp(role, "assistant");
+        if (is_asst && api_assistant_calls(pool, m, content.n > 0, &calls)) n = -1;
+        total += calls.n;
+        if (total > limit) n = -1;
+        n = api_put(n, IM_START);
+        n = api_text(n, role, 0);
+        n = api_text(n, "\n", 0);
+        if (is_asst && eng.qwen35 && idx > last_query) {   // (Qwen's empty reasoning of the turns after the question)
+            n = api_put(n, THINK);
+            n = api_text(n, "\n\n", 0);
+            n = api_put(n, THINK_END);
+            n = api_text(n, "\n\n", 0);
+        }
+        if (content.p) n = api_text(n, content.p, tm);
+        if (calls.p) n = api_text(n, calls.p, 1);
+        n = api_put(n, IM_END);
+        n = api_text(n, "\n", 0);
         sb_free(&content);
+        sb_free(&calls);
+        if (n < 0) return -1;
     }
-    api_ids[n++] = IM_START;
-    n = encode_into(api_ids, n, 16384, "assistant\n");
+    if (in_tool) {
+        n = api_put(n, IM_END);
+        n = api_text(n, "\n", 0);
+    }
+    n = api_put(n, IM_START);
+    n = api_text(n, "assistant\n", 0);
     if (eng.qwen35) {
-        api_ids[n++] = THINK;
-        n = encode_into(api_ids, n, 16384, "\n\n");
-        api_ids[n++] = THINK_END;
-        n = encode_into(api_ids, n, 16384, "\n\n");
+        n = api_put(n, THINK);
+        n = api_text(n, "\n\n", 0);
+        n = api_put(n, THINK_END);
+        n = api_text(n, "\n\n", 0);
     }
     return n;
 }
@@ -95,6 +219,11 @@ static void api_job(ApiJob* job) {
                   "invalid_body");
         return;
     }
+    if (cr.tools >= 0 && !eng.qwen35) {
+        free(pool);
+        api_error(job->fd, "HTTP/1.1 400 Bad Request", "Tools need Qwen3.5.", "invalid_request_error", "invalid_body");
+        return;
+    }
     int n = api_prompt(pool, &cr);
     if (n < 0) {
         free(pool);
@@ -102,8 +231,10 @@ static void api_job(ApiJob* job) {
                   "invalid_request_error", "context_length_exceeded");
         return;
     }
-    free(pool);
+    int tools_on = cr.tools >= 0;   // (the tools stay in the pool: the reply's calls are read against their schemas)
+    if (!tools_on) free(pool), pool = NULL;
     if (n + cr.max_tokens + 2 > (int)eng.ctx_limit) {
+        free(pool);
         api_error(job->fd, "HTTP/1.1 400 Bad Request", "The messages and max_tokens do not fit the context window.",
                   "invalid_request_error", "context_length_exceeded");
         return;
@@ -127,6 +258,7 @@ static void api_job(ApiJob* job) {
     engine_reset(&eng);
     if (engine_run(&eng, api_ids, n, 0, (float)cr.temperature, seed++, &next_token)) {
         api_error(job->fd, "HTTP/1.1 500 Internal Server Error", eng.error, "server_error", NULL);
+        free(pool);
         pos = 0;
         api_chat_end();
         return;
@@ -149,6 +281,8 @@ static void api_job(ApiJob* job) {
     Sb text, pend;   // the reply (all of it), and the bytes of the last tokens not yet a whole character
     sb_init(&text);
     sb_init(&pend);
+    int tc_seen = 0;       // tools: a <tool_call> has begun (what follows is held, then read as calls)
+    size_t held_from = 0;  // where it begins in text
     int produced = 0, stopped = 0;
     const char* finish = "length";
     // The tokens to write: the one a step drew, after those it kept from the MTP head's draft (the model has read
@@ -167,12 +301,29 @@ static void api_job(ApiJob* job) {
         const uint8_t* bytes = NULL;
         int nb = tok_piece(&tok, t, &bytes);
         produced++;
+        if (tools_on && (t == TOOL_CALL || t == TOOL_CALL_END)) {   // (added tokens: tok_piece gives no text for them)
+            bytes = (const uint8_t*)(t == TOOL_CALL ? "<tool_call>" : "</tool_call>");
+            nb = t == TOOL_CALL ? 11 : 12;
+        }
         if (nb > 0) {
             sb_add(&text, (const char*)bytes, nb);
             sb_add(&pend, (const char*)bytes, nb);
         }
         if (streamed && pend.n) {
             size_t whole = api_utf8_whole((const uint8_t*)pend.p, pend.n);
+            if (tools_on && tc_seen) {
+                whole = 0;   // (a call has begun: the rest is held in text)
+            } else if (tools_on) {   // the text before a <tool_call> goes out; a start of one waits
+                long at = api_tag_find(pend.p, pend.n);
+                if (at >= 0) {
+                    tc_seen = 1;
+                    held_from = text.n - pend.n + at;
+                    whole = (size_t)at;
+                } else {
+                    size_t hold = api_tag_holdback(pend.p, pend.n);
+                    if (whole > pend.n - hold) whole = pend.n - hold;
+                }
+            }
             if (whole) {
                 Sb ev;
                 sb_init(&ev);
@@ -183,6 +334,7 @@ static void api_job(ApiJob* job) {
                 pend.n -= whole;
                 pend.p[pend.n] = 0;
             }
+            if (tc_seen) pend.n = 0;   // (the rest is in text)
         }
         if (client_gone || produced == cr.max_tokens) break;
         if (iq < nq) continue;   // (the next token is one the last step kept)
@@ -208,6 +360,17 @@ static void api_job(ApiJob* job) {
         q[ne] = next_token;
         nq = ne + 1, iq = 0;
     }
+    ApiCall calls[API_MAX_CALLS];
+    int nc = 0;
+    size_t tend = text.n;   // where the text before the calls ends
+    static unsigned api_call_seq;
+    if (tools_on && !error && !client_gone && text.p) {
+        nc = api_parse_tool_calls(text.p, text.n, pool, cr.tools, calls, API_MAX_CALLS, api_call_seq + 1, &tend);
+        api_call_seq += nc;
+        if (nc) finish = "tool_calls";
+        while (tend > 0 && strchr(" \t\r\n", text.p[tend - 1])) tend--;
+    }
+    free(pool);
     double dt = now() - t0;
     say("api: %d tokens in %.1f s (%.1f tokens/s), %s", produced, dt, dt > 0 ? produced / dt : 0.0,
         error ? "engine error" : stopped ? "stopped on the console" : finish);
@@ -216,10 +379,26 @@ static void api_job(ApiJob* job) {
         if (!client_gone && !error) {
             Sb last;
             sb_init(&last);
-            api_json_chunk(&last, id, model, created, NULL, "", 0, finish);
-            if (last.p) api_send_event(fd, last.p);
-            sb_free(&last);
-            api_send(fd, "data: [DONE]\n\n", 14);
+            if (tools_on && !tc_seen && pend.n) {   // a start of a tag that did not come to be one
+                size_t whole = api_utf8_whole((const uint8_t*)pend.p, pend.n);
+                if (whole) {
+                    api_json_chunk(&last, id, model, created, NULL, pend.p, whole, NULL);
+                    if (last.p && api_send_event(fd, last.p)) client_gone = 1;
+                    sb_free(&last);
+                }
+            }
+            if (tools_on && tc_seen && !client_gone) {   // the calls, whole (or, if they are not good, the text held)
+                if (nc) api_json_chunk_calls(&last, id, model, created, calls, nc);
+                else api_json_chunk(&last, id, model, created, NULL, text.p + held_from, text.n - held_from, NULL);
+                if (last.p && api_send_event(fd, last.p)) client_gone = 1;
+                sb_free(&last);
+            }
+            if (!client_gone) {
+                api_json_chunk(&last, id, model, created, NULL, "", 0, finish);
+                if (last.p) api_send_event(fd, last.p);
+                sb_free(&last);
+                api_send(fd, "data: [DONE]\n\n", 14);
+            }
         }
         if (error && !client_gone) {   // the headers are out: the error goes in the stream
             Sb e;
@@ -234,7 +413,8 @@ static void api_job(ApiJob* job) {
         Sb body, head;
         sb_init(&body);
         sb_init(&head);
-        api_json_completion(&body, id, model, created, text.p ? text.p : "", text.n, finish, n, produced);
+        if (nc) api_json_completion_calls(&body, id, model, created, text.p, tend, calls, nc, n, produced);
+        else api_json_completion(&body, id, model, created, text.p ? text.p : "", text.n, finish, n, produced);
         sb_str(&head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
         sb_int(&head, (long long)body.n);
         sb_str(&head, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
@@ -242,6 +422,7 @@ static void api_job(ApiJob* job) {
         sb_free(&body);
         sb_free(&head);
     }
+    api_calls_free(calls, nc);
     sb_free(&text);
     sb_free(&pend);
     // the engine's state is this request's; the conversation on screen starts again at position 0

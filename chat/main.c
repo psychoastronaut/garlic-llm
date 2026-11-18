@@ -38,6 +38,10 @@
 #define IM_END eng.im_end
 #define THINK 248068u           // Qwen3.5 <think> and </think>: an empty block = answer without thinking
 #define THINK_END 248069u
+#define TOOL_CALL 248058u       // Qwen3.5's tool tags: single added tokens (tokenizer.bin marks them special: no text)
+#define TOOL_CALL_END 248059u
+#define TOOL_RESP 248066u
+#define TOOL_RESP_END 248067u
 #define MODEL_NAME (eng.qwen35 ? (eng.hidden >= 4096 ? "Qwen3.5-9B" : "Qwen3.5-4B") : "Qwen3-4B")
 #define MAX_REPLY 3000
 // One log per app (so that opening the other app does not lose this one's log), and the one before it

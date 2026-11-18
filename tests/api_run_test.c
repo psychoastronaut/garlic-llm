@@ -18,6 +18,10 @@
 #define THINK 1002u
 #define THINK_END 1003u
 #define EOS2 1004u
+#define TOOL_CALL 1010u   // the tool tags are single tokens (as Qwen3.5's), with no text of their own
+#define TOOL_CALL_END 1011u
+#define TOOL_RESP 1012u
+#define TOOL_RESP_END 1013u
 
 typedef struct {
     int qwen35, ctx_limit;
@@ -48,6 +52,8 @@ static int chat_begun, chat_ended, chat_replies, stop_at = -1;
 // Scripted reply: the model emits script[k], then IM_END. Tokens 500/501 are the two halves of "é".
 static const uint32_t* script;
 static int script_len, script_k, engine_calls, prompt_len_seen;
+static char prompt_txt[1 << 15];   // the last prompt, as text (the tags as written)
+static int prompt_n;
 static char wire[1 << 16];
 static size_t wire_n;
 static int wire_fail;   // the client has gone: sends fail
@@ -115,13 +121,24 @@ static int engine_run(MockEngine* e, const uint32_t* tokens, int n, int pos0, fl
         snprintf(e->error, sizeof(e->error), "mock GPU fault");
         return -1;
     }
-    if (n > 1) prompt_len_seen = n, next_pos = 0;   // the prompt (fed in one go, from position 0)
+    if (n > 1) {   // the prompt (fed in one go, from position 0)
+        prompt_len_seen = n, next_pos = 0;
+        prompt_n = 0;
+        for (int i = 0; i < n; i++) {
+            const char* sp = tokens[i] == IM_START ? "<|im_start|>" : tokens[i] == IM_END ? "<|im_end|>" :
+                             tokens[i] == THINK ? "<think>" : tokens[i] == THINK_END ? "</think>" :
+                             tokens[i] == TOOL_CALL ? "<tool_call>" : tokens[i] == TOOL_CALL_END ? "</tool_call>" :
+                             tokens[i] == TOOL_RESP ? "<tool_response>" : tokens[i] == TOOL_RESP_END ? "</tool_response>" : NULL;
+            if (sp) prompt_n += snprintf(prompt_txt + prompt_n, sizeof(prompt_txt) - prompt_n, "%s", sp);
+            else if (prompt_n < (int)sizeof(prompt_txt) - 1) prompt_txt[prompt_n++] = (char)(tokens[i] - 1);
+        }
+        prompt_txt[prompt_n < (int)sizeof(prompt_txt) ? prompt_n : (int)sizeof(prompt_txt) - 1] = 0;
+    }
     else fed++;
     if (pos0 != next_pos) pos_errors++;
     next_pos += n;
     if (script_k < script_len) *next = script[script_k++];
     else *next = IM_END;
-    (void)tokens;
     return 0;
 }
 
@@ -323,6 +340,213 @@ static void test_stop(void) {
     CHECK(pos == 0);
 }
 
+
+// ---- tool calling ---------------------------------------------------------------------------------------------------
+// The reply as the model's tokens: a byte per token, and the tool tags as their added tokens.
+static uint32_t reply_ids[4096];
+static int reply_n;
+static void run_reply(const char* body, const char* reply) {
+    reply_n = 0;
+    for (const char* p = reply; *p;) {
+        if (!strncmp(p, "<tool_call>", 11)) reply_ids[reply_n++] = TOOL_CALL, p += 11;
+        else if (!strncmp(p, "</tool_call>", 12)) reply_ids[reply_n++] = TOOL_CALL_END, p += 12;
+        else reply_ids[reply_n++] = (uint8_t)*p++ + 1;
+    }
+    run_job(body, reply_ids, reply_n);
+}
+
+#define WEATHER_TOOL                                                                                             \
+    "{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\",\"parameters\":" \
+    "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},"        \
+    "\"required\":[\"city\"]}}}"
+#define CALL_ROME                                                                                                  \
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=days>\n3\n</parameter>\n" \
+    "</function>\n</tool_call>"
+
+static int ends_with(const char* s, const char* suffix) {
+    size_t a = strlen(s), b = strlen(suffix);
+    return a >= b && !strcmp(s + a - b, suffix);
+}
+
+static void test_tools_prompt(void) {
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"system\",\"content\":\" Be brief. \"},"
+              "{\"role\":\"user\",\"content\":\"Weather in Rome?\"}]}", "ok");
+    // Qwen3.5's template: the tools in the system message, the system prompt after them, then the turns
+    CHECK(!strncmp(prompt_txt,
+                   "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+                   "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", "
+                   "\"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": "
+                   "{\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function "
+                   "ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
+                   "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n",
+                   strlen("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+                          "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": "
+                          "\"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": "
+                          "{\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n"
+                          "</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO "
+                          "suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\n"
+                          "value_1\n</parameter>\n")));
+    CHECK(strstr(prompt_txt, "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST") != NULL);
+    CHECK(strstr(prompt_txt, "tell the user about function calls\n</IMPORTANT>\n\nBe brief.<|im_end|>\n<|im_start|>user\n"
+                             "Weather in Rome?<|im_end|>\n") != NULL);
+    CHECK(strstr(prompt_txt, "MUST call one of") == NULL);
+    CHECK(ends_with(prompt_txt, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+
+    // no system prompt: the tools alone; "required" adds its line
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"tool_choice\":\"required\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", "ok");
+    CHECK(strstr(prompt_txt, "</IMPORTANT><|im_end|>\n<|im_start|>user\nx<|im_end|>\n") != NULL);
+    CHECK(strstr(prompt_txt, "- You MUST call one of the functions above in this reply\n</IMPORTANT>") != NULL);
+
+    // tool_choice "none" (or no tools): the prompt is the plain one
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"tool_choice\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", "ok");
+    CHECK(!strcmp(prompt_txt, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    run_reply("{\"tools\":[],\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", "ok");
+    CHECK(!strcmp(prompt_txt, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+}
+
+static void test_tools_history(void) {
+    // a user question, the assistant's call, two results, the assistant's answer and a new question
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"user\",\"content\":\"Rome?\"},"
+              "{\"role\":\"assistant\",\"content\":\"Checking.\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\","
+              "\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Rome\\\",\\\"days\\\":3,\\\"x\\\":true,"
+              "\\\"o\\\":{\\\"a\\\":[1,null]}}\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":"
+              "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Oslo\"}}}]},"
+              "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\" sunny\\n\"},"
+              "{\"role\":\"tool\",\"tool_call_id\":\"call_2\",\"content\":\"snow\"}]}", "ok");
+    CHECK(strstr(prompt_txt,
+                 "<|im_start|>user\nRome?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nChecking.\n\n<tool_call>\n"
+                 "<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=days>\n3\n</parameter>\n"
+                 "<parameter=x>\nTrue\n</parameter>\n<parameter=o>\n{\"a\": [1, null]}\n</parameter>\n</function>\n"
+                 "</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n"
+                 "</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<tool_response>\n"
+                 "snow\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+
+    // a call without text; and after a new question the old turn has no empty thought block
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"user\",\"content\":\"Rome?\"},"
+              "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},"
+              "{\"role\":\"tool\",\"content\":\"r\"},{\"role\":\"assistant\",\"content\":\"Sunny.\"},"
+              "{\"role\":\"user\",\"content\":\"Oslo?\"}]}", "ok");
+    CHECK(strstr(prompt_txt, "<|im_start|>assistant\n<tool_call>\n<function=f>\n</function>\n</tool_call><|im_end|>\n"
+                             "<|im_start|>user\n<tool_response>\nr\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+                             "Sunny.<|im_end|>\n<|im_start|>user\nOslo?<|im_end|>\n") != NULL);
+
+    // history with results but tool_choice "none": rendered as the template does, no tools block
+    run_reply("{\"tool_choice\":\"none\",\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"user\",\"content\":\"q\"},"
+              "{\"role\":\"tool\",\"content\":\"r\"}]}", "ok");
+    CHECK(strstr(prompt_txt, "# Tools") == NULL);
+    CHECK(strstr(prompt_txt, "<|im_start|>user\n<tool_response>\nr\n</tool_response><|im_end|>\n") != NULL);
+
+    // malformed calls in the history
+    run_reply("{\"messages\":[{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"assistant\",\"tool_calls\":[3]}]}", "ok");
+    CHECK(strstr(wire, "context_length_exceeded") != NULL);
+}
+
+static void test_tools_reply(void) {
+    const char* body = "{\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"user\",\"content\":\"Rome?\"}]}";
+    run_reply(body, "Checking.\n\n" CALL_ROME);
+    CHECK(strstr(wire, "\"content\":\"Checking.\",\"tool_calls\":[{\"id\":\"call_") != NULL);
+    CHECK(strstr(wire, "\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":"
+                       "\"{\\\"city\\\":\\\"Rome\\\",\\\"days\\\":3}\"}}]") != NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"tool_calls\"") != NULL);
+    CHECK(strstr(wire, "<tool_call>") == NULL);
+
+    // no text before: content is null; two calls: two ids
+    run_reply(body, CALL_ROME "\n" CALL_ROME);
+    CHECK(strstr(wire, "\"content\":null,\"tool_calls\":[{\"id\":\"call_") != NULL);
+    const char* first = strstr(wire, "\"id\":\"call_");
+    CHECK(first && strstr(first + 5, "\"id\":\"call_") != NULL);
+    CHECK(strstr(wire, "\"id\":\"call_1\"") == NULL || first != strstr(first + 5, "\"id\":\"call_"));
+
+    // an answer without a call, and a call cut off before its end
+    run_reply(body, "It is sunny.");
+    CHECK(strstr(wire, "\"content\":\"It is sunny.\"") != NULL && strstr(wire, "tool_calls") == NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"stop\"") != NULL);
+    run_reply(body, "Hm.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRo");
+    CHECK(strstr(wire, "\"content\":\"Hm.\\n\\n<tool_call>\\n<function=get_weather>") != NULL);
+    CHECK(strstr(wire, "\"tool_calls\":[") == NULL && strstr(wire, "\"finish_reason\":\"stop\"") != NULL);
+
+    // a request without tools is answered as always: the tag is the token's, with no text
+    run_reply("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", "a<tool_call>b");
+    CHECK(strstr(wire, "\"content\":\"ab\"") != NULL && strstr(wire, "tool_calls") == NULL);
+}
+
+// The text of the streamed content deltas, joined (JSON escapes left as written).
+static const char* stream_text(void) {
+    static char out[4096];
+    size_t n = 0;
+    for (const char* p = wire; (p = strstr(p, "\"content\":\"")) != NULL;) {
+        p += 11;
+        while (*p && !(*p == '"') && n < sizeof(out) - 1) {
+            if (*p == '\\' && p[1]) out[n++] = *p++;
+            out[n++] = *p++;
+        }
+    }
+    out[n] = 0;
+    return out;
+}
+
+static void test_tools_stream(void) {
+    const char* body = "{\"stream\":true,\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"user\",\"content\":\"Rome?\"}]}";
+    run_reply(body, "Checking.\n\n" CALL_ROME);
+    CHECK(!strcmp(stream_text(), "Checking.\\n\\n"));
+    CHECK(strstr(wire, "<tool_call>") == NULL && strstr(wire, "<function") == NULL);
+    const char* tc = strstr(wire, "\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_");
+    CHECK(tc != NULL);
+    CHECK(strstr(wire, "\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Rome\\\",\\\"days\\\":3}\"}}]},\"finish_reason\":null") != NULL);
+    const char* fin = strstr(wire, "\"finish_reason\":\"tool_calls\"");
+    CHECK(fin && tc && fin > tc);
+    CHECK(strstr(wire, "data: [DONE]\n\n") > fin);
+    CHECK(strstr(wire, "\"finish_reason\":\"stop\"") == NULL);
+
+    // two calls, no text
+    run_reply(body, CALL_ROME CALL_ROME);
+    CHECK(strstr(wire, "\"index\":1,\"id\":\"call_") != NULL);
+
+    // a start of a tag that is not one reaches the client; so does a call that is cut off
+    run_reply(body, "a <tool b <tool_");
+    CHECK(!strcmp(stream_text(), "a <tool b <tool_"));
+    CHECK(strstr(wire, "\"finish_reason\":\"stop\"") != NULL);
+    run_reply(body, "Hm <tool_call>\n<function=get_weather>\n<parameter=city>\nRo");
+    CHECK(!strcmp(stream_text(), "Hm <tool_call>\\n<function=get_weather>\\n<parameter=city>\\nRo"));
+    CHECK(strstr(wire, "\"finish_reason\":\"stop\"") != NULL && strstr(wire, "tool_calls") == NULL);
+
+    // without tools nothing changes: tokens stream as before
+    run_reply("{\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", "a <tool b");
+    CHECK(strstr(wire, "\"content\":\"a\"") != NULL && strstr(wire, "\"content\":\"b\"") != NULL);
+}
+
+static void test_tools_errors(void) {
+    run_reply("{\"tools\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", "ok");
+    CHECK(strncmp(wire, "HTTP/1.1 400", 12) == 0 && strstr(wire, "'tools' must be an array") != NULL);
+    run_reply("{\"tools\":[{\"type\":\"function\",\"function\":{}}],\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", "ok");
+    CHECK(strncmp(wire, "HTTP/1.1 400", 12) == 0);
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"tool_choice\":\"sometimes\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", "ok");
+    CHECK(strncmp(wire, "HTTP/1.1 400", 12) == 0 && strstr(wire, "tool_choice") != NULL);
+
+    // the tools do not fit the context
+    eng.ctx_limit = 300;
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":50}", "ok");
+    eng.ctx_limit = 4096;
+    CHECK(strncmp(wire, "HTTP/1.1 400", 12) == 0 && strstr(wire, "context_length_exceeded") != NULL);
+
+    // a huge tool: refused, not overflowed
+    size_t big = 100000;
+    char* body = malloc(big + 400);
+    int k = sprintf(body, "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\"");
+    memset(body + k, 'd', big);
+    k += (int)big;
+    k += sprintf(body + k, "\"}}],\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}");
+    run_reply(body, "ok");
+    CHECK(strncmp(wire, "HTTP/1.1 400", 12) == 0 && strstr(wire, "context_length_exceeded") != NULL);
+    free(body);
+
+    // the older Qwen3 model has another template: no tools
+    eng.qwen35 = 0;
+    run_reply("{\"tools\":[" WEATHER_TOOL "],\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", "ok");
+    eng.qwen35 = 1;
+    CHECK(strncmp(wire, "HTTP/1.1 400", 12) == 0 && strstr(wire, "Qwen3.5") != NULL);
+}
+
 static void test_utf8(void) {
     CHECK(api_utf8_whole((const uint8_t*)"\xc3", 1) == 0);
     CHECK(api_utf8_whole((const uint8_t*)"a\xc3", 2) == 1);
@@ -342,6 +566,11 @@ int main(void) {
         test_client_gone();
         test_spec();
         test_stop();
+        test_tools_prompt();
+        test_tools_history();
+        test_tools_reply();
+        test_tools_stream();
+        test_tools_errors();
         CHECK(pos_errors == 0);            // every token went in at the position after the one before
         CHECK(chat_begun == chat_ended);   // every request that took the screen gave it back
         CHECK(chat_replies <= chat_begun);
